@@ -1,32 +1,48 @@
-from PyPDF2 import PdfReader
+# app/ingestion_chroma.py
 from sentence_transformers import SentenceTransformer
-from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct, VectorParams, Distance
-import uuid
-from app.config import QDRANT_HOST, QDRANT_PORT, QDRANT_COLLECTION, EMBED_MODEL_NAME
+# CHANGED: Import PersistentClient
+from chromadb import PersistentClient
+# REMOVED: from chromadb.config import Settings (It's no longer needed) 
+from chromadb.utils import embedding_functions
 from app.db import crud
+from fastapi import UploadFile
+from PyPDF2 import PdfReader
+import uuid, io
 
-EMBED_DIM = 384 
+EMBED_DIM = 384
+CHROMA_DIR = "chroma_db"  
+EMBED_MODEL = "all-MiniLM-L6-v2"
+COLLECTION_NAME = "pdf_chunks"
+
 
 class Ingestor:
     def __init__(self):
-        self.embedder = SentenceTransformer(EMBED_MODEL_NAME)
-        self.qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+        self.embedder = SentenceTransformer(EMBED_MODEL)
+        # FIX: Use PersistentClient with the path argument for local persistence
+        self.client = PersistentClient(path=CHROMA_DIR)
+        
+        self.embed_func = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name=EMBED_MODEL
+        )
+
         try:
-            self.qdrant.recreate_collection(
-                collection_name=QDRANT_COLLECTION,
-                vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE)
+            self.collection = self.client.get_collection(
+                name=COLLECTION_NAME,
+                embedding_function=self.embed_func
             )
         except Exception:
-            pass
+            self.collection = self.client.create_collection(
+                name=COLLECTION_NAME,
+                embedding_function=self.embed_func
+            )
 
-    def load_pdf(self, file_bytes):
-        reader = PdfReader(file_bytes)
+    def load_pdf(self, file_stream):
+        reader = PdfReader(file_stream)
         pages = []
         for i, p in enumerate(reader.pages):
             text = p.extract_text()
             if text and text.strip():
-                pages.append({"page_num": i+1, "text": text})
+                pages.append({"page_num": i + 1, "text": text})
         return pages
 
     def _chunk_text(self, text, chunk_size=1000, overlap=200):
@@ -39,34 +55,47 @@ class Ingestor:
             start += chunk_size - overlap
         return chunks
 
-    def ingest(self, file_bytes, filename):
+    def ingest(self, file_stream: io.BytesIO, filename: str):
         doc = crud.create_document(filename)
         run = crud.create_ingest_run(doc.id)
         total_chunks = 0
+
         try:
-            pages = self.load_pdf(file_bytes)
+            file_stream.seek(0)
+            pages = self.load_pdf(file_stream)
+            crud.mark_document_indexed(doc.id, page_count=len(pages))
+
             for p in pages:
                 chunks = self._chunk_text(p["text"])
                 if not chunks:
                     continue
+
+                # Embed chunks
                 embeddings = self.embedder.encode(chunks)
-                points = []
-                for idx, emb in enumerate(embeddings):
-                    points.append(PointStruct(
-                        id=str(uuid.uuid4()),
-                        vector=emb.tolist(),
-                        payload={
-                            "doc_id": str(doc.id),
-                            "doc_name": filename,
-                            "page_num": p["page_num"],
-                            "chunk_id": idx,
-                            "text": chunks[idx][:2000]
-                        }
-                    ))
-                self.qdrant.upsert(collection_name=QDRANT_COLLECTION, points=points)
-                total_chunks += len(points)
-            crud.mark_document_indexed(doc.id, page_count=len(pages))
+
+                # Prepare data for Chroma
+                ids = [str(uuid.uuid4()) for _ in chunks]
+                metadatas = [{
+                    "doc_id": str(doc.id),
+                    "doc_name": filename,
+                    "page_num": p["page_num"],
+                    "chunk_id": idx,
+                    "text": chunks[idx][:2000]
+                } for idx in range(len(chunks))]
+
+                # Upsert into Chroma
+                self.collection.add(
+                    ids=ids,
+                    embeddings=embeddings.tolist(),
+                    metadatas=metadatas,
+                    documents=chunks
+                )
+
+                total_chunks += len(chunks)
+
+            crud.finish_ingest_run(run.id, total_chunks)
             return {"status": "ok", "document_id": doc.id, "chunks": total_chunks}
+
         except Exception as e:
             crud.mark_document_error(doc.id, str(e))
             crud.fail_ingest_run(run.id, str(e))
