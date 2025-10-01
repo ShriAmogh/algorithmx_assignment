@@ -1,0 +1,27 @@
+# Python virtual environment
+venv/
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+*.log
+
+# Git files
+.git/
+.gitignore
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker files (optional if you rebuild them inside container)
+docker-compose.override.yml
+
+# IDE/editor files
+.vscode/
+.idea/
